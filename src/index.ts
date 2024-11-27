@@ -79,6 +79,57 @@ const deleteRemoteFiles = async (bucket: string, prefix: string) => {
     }
 };
 
+const waitForPromiseInBatches = async (promises: Promise<any>[], batchSize: number, maxRetries: number = 3, retryDelay: number = 1000) => {
+    const data = [];
+    for (let i = 0; i < promises.length; i += batchSize) {
+        const batch = promises.slice(i, i + batchSize);
+        const batchResults = await Promise.allSettled(batch);
+        
+        const succeeded = [];
+        const failed = [];
+        
+        batchResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                succeeded.push(result.value);
+            } else {
+                failed.push({
+                    promise: batch[index],
+                    error: result.reason
+                });
+            }
+        });
+        
+        // Retry failed promises
+        let retriesLeft = maxRetries;
+        let currentFailed = failed;
+        
+        while (currentFailed.length > 0 && retriesLeft > 0) {
+            console.warn(`Retrying ${currentFailed.length} failed promises. Attempts remaining: ${retriesLeft}`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            
+            const retryResults = await Promise.allSettled(currentFailed.map(f => f.promise));
+            currentFailed = [];
+            
+            retryResults.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                    succeeded.push(result.value);
+                } else {
+                    currentFailed.push(failed[index]);
+                }
+            });
+            
+            retriesLeft--;
+        }
+        
+        if (currentFailed.length > 0) {
+            console.error(`${currentFailed.length} promises failed after all retry attempts`);
+        }
+        
+        data.push(...succeeded);
+    }
+    return data.filter(result => result !== undefined);
+};
+
 const run = async (config: R2Config) => {
     const map = new Map<string, PutObjectCommandOutput | CompleteMultipartUploadCommandOutput>();
     const urls: FileMap = {};
@@ -89,19 +140,19 @@ const run = async (config: R2Config) => {
     }
 
     const files: FileMap = getFileList(config.sourceDir);
+    const fileEntries = Object.entries(files);
+    const batchSize = 40;
 
-    for (const file in files) {
-        console.log(config.sourceDir);
-        console.log(config.destinationDir);
-        //const fileName = file.replace(config.sourceDir, "");
-        const fileName = files[file];
-        // const fileKey = path.join(config.destinationDir !== "" ? config.destinationDir : config.sourceDir, fileName);
+    const uploadPromises = fileEntries.map(([file, fileName]) => async () => {
+        if (fileName.includes('.gitkeep')) {
+            return;
+        }
 
         const destinationDir = config.destinationDir.split(path.sep).join('/');
-        const fileKey = path.posix.join(destinationDir !== "" ? destinationDir : config.sourceDir.split(path.sep).join('/'), fileName.split(path.sep).join('/'));
-
-        if (fileName.includes('.gitkeep'))
-            continue;
+        const fileKey = path.posix.join(
+            destinationDir !== "" ? destinationDir : config.sourceDir.split(path.sep).join('/'),
+            fileName.split(path.sep).join('/')
+        );
 
         console.log(fileKey);
 
@@ -110,19 +161,32 @@ const run = async (config: R2Config) => {
             console.info(`R2 Info - Uploading ${file} (${formatFileSize(file)}) to ${fileKey}`);
             const upload = fileMB > config.multiPartSize ? uploadMultiPart : putObject;
             const result = await upload(file, fileKey, config, config.maxTries, config.retryTimeout);
-            map.set(file, result.output);
-            urls[file] = result.url;
+            return {
+                file,
+                result
+            };
         } catch (err: unknown) {
             const error = err as S3ServiceException;
             if (error.hasOwnProperty("$metadata")) {
-                if (error.$metadata.httpStatusCode !== 412) // If-None-Match
+                if (error.$metadata.httpStatusCode !== 412) { // If-None-Match
                     throw error;
+                }
             } else {
                 console.error(`Error while uploading ${file} to ${fileKey}: `, err);
                 throw error;
             }
         }
-    }
+    });
+
+    // @ts-ignore
+    const results = await waitForPromiseInBatches(uploadPromises, batchSize, config.maxTries, config.retryTimeout);
+    
+    results.forEach(result => {
+        if (result) {
+            map.set(result.file, result.result.output);
+            urls[result.file] = result.result.url;
+        }
+    });
 
     if (config.outputFileUrl) setOutput('file-urls', urls);
     return map;
