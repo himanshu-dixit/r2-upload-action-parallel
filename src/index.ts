@@ -179,10 +179,10 @@ const run = async (config: R2Config) => {
     });
 
     // @ts-ignore
-    const results = await waitForPromiseInBatches(uploadPromises, batchSize, config.maxTries, config.retryTimeout);
+    const results = await waitForPromiseInBatches(uploadPromises.map(p => p()), batchSize, config.maxTries, config.retryTimeout);
     
     results.forEach(result => {
-        if (result) {
+        if (result && result.result) {
             map.set(result.file, result.result.output);
             urls[result.file] = result.result.url;
         }
