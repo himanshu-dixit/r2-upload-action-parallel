@@ -62093,6 +62093,49 @@ const deleteRemoteFiles = async (bucket, prefix) => {
         throw err;
     }
 };
+const waitForPromiseInBatches = async (promises, batchSize, maxRetries = 3, retryDelay = 1000) => {
+    const data = [];
+    for (let i = 0; i < promises.length; i += batchSize) {
+        const batch = promises.slice(i, i + batchSize);
+        const batchResults = await Promise.allSettled(batch);
+        const succeeded = [];
+        const failed = [];
+        batchResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                succeeded.push(result.value);
+            }
+            else {
+                failed.push({
+                    promise: batch[index],
+                    error: result.reason
+                });
+            }
+        });
+        // Retry failed promises
+        let retriesLeft = maxRetries;
+        let currentFailed = failed;
+        while (currentFailed.length > 0 && retriesLeft > 0) {
+            console.warn(`Retrying ${currentFailed.length} failed promises. Attempts remaining: ${retriesLeft}`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            const retryResults = await Promise.allSettled(currentFailed.map(f => f.promise));
+            currentFailed = [];
+            retryResults.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                    succeeded.push(result.value);
+                }
+                else {
+                    currentFailed.push(failed[index]);
+                }
+            });
+            retriesLeft--;
+        }
+        if (currentFailed.length > 0) {
+            console.error(`${currentFailed.length} promises failed after all retry attempts`);
+        }
+        data.push(...succeeded);
+    }
+    return data.filter(result => result !== undefined);
+};
 const run = async (config) => {
     const map = new Map();
     const urls = {};
@@ -62101,37 +62144,46 @@ const run = async (config) => {
         await deleteRemoteFiles(config.bucket, remotePrefix);
     }
     const files = getFileList(config.sourceDir);
-    for (const file in files) {
-        console.log(config.sourceDir);
-        console.log(config.destinationDir);
-        //const fileName = file.replace(config.sourceDir, "");
-        const fileName = files[file];
-        // const fileKey = path.join(config.destinationDir !== "" ? config.destinationDir : config.sourceDir, fileName);
+    const fileEntries = Object.entries(files);
+    const batchSize = 40;
+    const uploadPromises = fileEntries.map(([file, fileName]) => async () => {
+        if (fileName.includes('.gitkeep')) {
+            return;
+        }
         const destinationDir = config.destinationDir.split((external_path_default()).sep).join('/');
         const fileKey = external_path_default().posix.join(destinationDir !== "" ? destinationDir : config.sourceDir.split((external_path_default()).sep).join('/'), fileName.split((external_path_default()).sep).join('/'));
-        if (fileName.includes('.gitkeep'))
-            continue;
         console.log(fileKey);
         try {
             const fileMB = getFileSizeMB(file);
             console.info(`R2 Info - Uploading ${file} (${formatFileSize(file)}) to ${fileKey}`);
             const upload = fileMB > config.multiPartSize ? uploadMultiPart : putObject;
             const result = await upload(file, fileKey, config, config.maxTries, config.retryTimeout);
-            map.set(file, result.output);
-            urls[file] = result.url;
+            return {
+                file,
+                result
+            };
         }
         catch (err) {
             const error = err;
             if (error.hasOwnProperty("$metadata")) {
-                if (error.$metadata.httpStatusCode !== 412) // If-None-Match
+                if (error.$metadata.httpStatusCode !== 412) { // If-None-Match
                     throw error;
+                }
             }
             else {
                 console.error(`Error while uploading ${file} to ${fileKey}: `, err);
                 throw error;
             }
         }
-    }
+    });
+    // @ts-ignore
+    const results = await waitForPromiseInBatches(uploadPromises, batchSize, config.maxTries, config.retryTimeout);
+    results.forEach(result => {
+        if (result) {
+            map.set(result.file, result.result.output);
+            urls[result.file] = result.result.url;
+        }
+    });
     if (config.outputFileUrl)
         (0,core.setOutput)('file-urls', urls);
     return map;
